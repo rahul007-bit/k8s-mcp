@@ -1,0 +1,22 @@
+[project]
+name = "mcp-k8s"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.13.1",
+    "fastapi>=0.119.1",
+    "fastmcp>=2.12.4",
+    "google-genai>=1.45.0",
+    "httpx>=0.28.1",
+    "kubernetes>=34.1.0",
+    "mcp[cli]>=1.18.0",
+    "ollama>=0.6.0",
+    "pydantic>=2.12.3",
+    "python-dotenv>=1.1.1",
+    "pyyaml>=6.0.3",
+    "together>=1.5.27",
+    "uvicorn>=0.38.0",
+    "websockets>=15.0.1",
+]

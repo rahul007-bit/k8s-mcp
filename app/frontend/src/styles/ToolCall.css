@@ -1,0 +1,168 @@
+.tool-call {
+  background: #f9f9f9;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  overflow: hidden;
+  transition: all 0.2s;
+}
+
+.tool-call-header {
+  padding: 10px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 500;
+  font-size: 13px;
+  user-select: none;
+  transition: background 0.2s;
+}
+
+.tool-call-header:hover {
+  background: #f0f0f0;
+}
+
+.tool-status-emoji {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.tool-name {
+  flex: 1;
+  color: #333;
+  font-family: monospace;
+}
+
+.tool-status-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  background: #e0e0e0;
+  color: #666;
+  flex-shrink: 0;
+}
+
+.expand-icon {
+  font-size: 12px;
+  color: #999;
+  transition: transform 0.2s;
+  flex-shrink: 0;
+}
+
+.tool-call-header:hover .expand-icon {
+  color: #333;
+}
+
+.tool-call-executing .tool-status-badge {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.tool-call-completed .tool-status-badge {
+  background: #d4edda;
+  color: #155724;
+}
+
+.tool-call-failed .tool-status-badge {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.tool-call-details {
+  padding: 12px;
+  border-top: 1px solid #e0e0e0;
+  background: white;
+  font-size: 12px;
+}
+
+.tool-args, .tool-result {
+  margin-bottom: 10px;
+}
+
+.tool-args:last-child, .tool-result:last-child {
+  margin-bottom: 0;
+}
+
+.tool-args .label, .tool-result .label {
+  font-weight: 600;
+  margin-bottom: 5px;
+  display: block;
+  color: #333;
+  font-size: 12px;
+}
+
+.args-code {
+  background: #f5f5f5;
+  padding: 8px;
+  border-radius: 4px;
+  overflow-x: auto;
+  max-height: 120px;
+  overflow-y: auto;
+  font-size: 11px;
+  color: #666;
+  line-height: 1.4;
+  border-left: 3px solid #667eea;
+}
+
+.result-code {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 10px;
+  border-radius: 4px;
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.4;
+  border-left: 3px solid #667eea;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+.result-code::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.result-code::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+.result-code::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 3px;
+}
+
+.result-code::-webkit-scrollbar-thumb:hover {
+  background: #666;
+}
+
+.tool-call-history {
+  background: white;
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  height: 600px;
+  overflow-y: auto;
+  min-width: 300px;
+}
+
+.tool-call-history h3 {
+  margin-top: 0;
+  margin-bottom: 16px;
+  color: #333;
+  font-size: 16px;
+}
+
+.empty-history {
+  color: #999;
+  text-align: center;
+  padding: 20px 10px;
+  font-size: 14px;
+}
+
+.tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
