@@ -1,0 +1,11 @@
+# .gitignore for vite project
+.env
+.env.local
+node_modules/
+dist/
+.DS_Store
+.vscode/
+.idea/
+*.log
+*.pyc
+__pycache__/
