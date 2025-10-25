@@ -151,125 +151,157 @@ class ChatService:
                 'data': {'message': 'Processing...'}
             }
             
-            # Generate response from Gemini with streaming
-            response = self.gemini_service.generate_with_tools(history, tools)
-            print(f"[DEBUG] Got response from Gemini")
+            # Iterative loop - keeps calling Gemini until no more tool calls
+            max_iterations = 10
+            iteration = 0
             
-            # Parse response
-            response_text = ""
-            tool_calls = []
-            
-            # Process streaming response
-            for chunk in response:
-                print(f"[DEBUG] Processing chunk: {type(chunk)}")
+            while iteration < max_iterations:
+                iteration += 1
+                print(f"[DEBUG] Iteration {iteration}/{max_iterations}")
                 
-                if hasattr(chunk, 'candidates') and chunk.candidates:
-                    for candidate in chunk.candidates:
-                        if hasattr(candidate, 'content') and candidate.content:
-                            if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                                for part in candidate.content.parts:
-                                    # Handle text
-                                    if hasattr(part, 'text') and part.text:
-                                        print(f"[DEBUG] Got text: {part.text[:50]}...")
-                                        response_text += part.text
-                                        
-                                        # Stream text in chunks
-                                        yield {
-                                            'type': 'text',
-                                            'data': {
-                                                'text': part.text,
-                                                'conversation_id': conversation_id
-                                            }
-                                        }
-                                    
-                                    # Handle function calls
-                                    if hasattr(part, 'function_call') and part.function_call:
-                                        tool_name = part.function_call.name
-                                        tool_args = {}
-                                        
-                                        if hasattr(part.function_call, 'args') and part.function_call.args:
-                                            # Convert args (could be dict or other type)
-                                            args = part.function_call.args
-                                            if isinstance(args, dict):
-                                                tool_args = args
-                                            else:
-                                                tool_args = dict(args)
-                                        
-                                        print(f"[DEBUG] Got tool call: {tool_name}")
-                                        
-                                        # Stream tool call start
-                                        yield {
-                                            'type': 'tool_call_start',
-                                            'data': {
-                                                'tool_name': tool_name,
-                                                'arguments': tool_args,
-                                                'conversation_id': conversation_id
-                                            }
-                                        }
-                                        
-                                        # Call the MCP tool asynchronously
-                                        try:
-                                            result = await self.mcp_service.call_tool_async(tool_name, tool_args)
+                # Generate response from Gemini with streaming
+                response = self.gemini_service.generate_with_tools(history, tools)
+                print(f"[DEBUG] Got response from Gemini")
+                
+                # Parse response
+                response_text = ""
+                function_calls = []
+                
+                # Process streaming response
+                for chunk in response:
+                    print(f"[DEBUG] Processing chunk: {type(chunk)}")
+                    
+                    if hasattr(chunk, 'candidates') and chunk.candidates:
+                        for candidate in chunk.candidates:
+                            if hasattr(candidate, 'content') and candidate.content:
+                                if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                    for part in candidate.content.parts:
+                                        # Handle text
+                                        if hasattr(part, 'text') and part.text:
+                                            print(f"[DEBUG] Got text: {part.text[:50]}...")
+                                            response_text += part.text
                                             
-                                            tool_calls.append({
-                                                'tool_name': tool_name,
-                                                'arguments': tool_args,
-                                                'result': result,
-                                                'status': 'completed'
-                                            })
-                                            
-                                            # Stream tool call result
+                                            # Stream text in chunks
                                             yield {
-                                                'type': 'tool_call_end',
+                                                'type': 'text',
                                                 'data': {
-                                                    'tool_name': tool_name,
-                                                    'arguments': tool_args,
-                                                    'result': result,
-                                                    'status': 'completed',
+                                                    'text': part.text,
                                                     'conversation_id': conversation_id
                                                 }
                                             }
-                                        except Exception as e:
-                                            print(f"[DEBUG] Tool call failed: {str(e)}")
-                                            import traceback
-                                            traceback.print_exc()
-                                            
-                                            tool_calls.append({
-                                                'tool_name': tool_name,
-                                                'arguments': tool_args,
-                                                'result': f"Error: {str(e)}",
-                                                'status': 'failed'
-                                            })
-                                            
-                                            # Stream tool call error
-                                            yield {
-                                                'type': 'tool_call_end',
-                                                'data': {
-                                                    'tool_name': tool_name,
-                                                    'arguments': tool_args,
-                                                    'result': f"Error: {str(e)}",
-                                                    'status': 'failed',
-                                                    'conversation_id': conversation_id
-                                                }
-                                            }
-            
-            print(f"[DEBUG] Final response text length: {len(response_text)}")
-            print(f"[DEBUG] Tool calls: {len(tool_calls)}")
-            
-            # Add assistant response to history
-            if response_text or tool_calls:
+                                        
+                                        # Handle function calls
+                                        if hasattr(part, 'function_call') and part.function_call:
+                                            function_calls.append(part.function_call)
+                
+                # If no function calls, we're done
+                if not function_calls:
+                    if response_text:
+                        history.append({
+                            'role': 'model',
+                            'parts': [{'text': response_text}]
+                        })
+                    break
+                
+                # Add assistant message with function calls to history
                 history.append({
                     'role': 'model',
-                    'parts': [{'text': response_text if response_text else 'Tool call executed'}]
+                    'parts': [{'function_call': fc} for fc in function_calls]
                 })
+                
+                # Execute function calls and collect responses
+                function_response_parts = []
+                for fc in function_calls:
+                    tool_name: str = fc.name if hasattr(fc, 'name') else 'unknown'
+                    tool_args = {}
+                    
+                    if hasattr(fc, 'args') and fc.args:
+                        args = fc.args
+                        if isinstance(args, dict):
+                            tool_args = args
+                        else:
+                            tool_args = dict(args)
+                    
+                    print(f"[DEBUG] Got tool call: {tool_name}")
+                    
+                    # Stream tool call start
+                    yield {
+                        'type': 'tool_call_start',
+                        'data': {
+                            'tool_name': tool_name,
+                            'arguments': tool_args,
+                            'conversation_id': conversation_id
+                        }
+                    }
+                    
+                    # Call the MCP tool asynchronously
+                    try:
+                        result = await self.mcp_service.call_tool_async(tool_name, tool_args)
+                        print(f"[DEBUG] Tool {tool_name} executed successfully")
+                        
+                        # Stream tool call result
+                        yield {
+                            'type': 'tool_call_end',
+                            'data': {
+                                'tool_name': tool_name,
+                                'arguments': tool_args,
+                                'result': result,
+                                'status': 'completed',
+                                'conversation_id': conversation_id
+                            }
+                        }
+                        
+                        # Add function response
+                        function_response_parts.append({
+                            'function_response': {
+                                'name': tool_name,
+                                'response': {'result': result}
+                            }
+                        })
+                    except Exception as e:
+                        print(f"[DEBUG] Tool call failed: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        
+                        error_msg = f"Error: {str(e)}"
+                        
+                        # Stream tool call error
+                        yield {
+                            'type': 'tool_call_end',
+                            'data': {
+                                'tool_name': tool_name,
+                                'arguments': tool_args,
+                                'result': error_msg,
+                                'status': 'failed',
+                                'conversation_id': conversation_id
+                            }
+                        }
+                        
+                        # Add error response
+                        function_response_parts.append({
+                            'function_response': {
+                                'name': tool_name,
+                                'response': {'result': error_msg}
+                            }
+                        })
+                
+                # Add function responses to history
+                history.append({
+                    'role': 'user',
+                    'parts': function_response_parts
+                })
+                
+                print(f"[DEBUG] Iteration {iteration} completed, looping for next response...")
+            
+            if iteration >= max_iterations:
+                print(f"[DEBUG] Reached max iterations ({max_iterations})")
             
             # Yield completion event
             yield {
                 'type': 'complete',
                 'data': {
-                    'message': response_text,
-                    'tool_calls': tool_calls,
-                    'conversation_id': conversation_id
+                    'conversation_id': conversation_id,
+                    'iterations': iteration
                 }
             }
         except Exception as e:
