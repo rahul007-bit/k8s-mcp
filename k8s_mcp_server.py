@@ -1653,6 +1653,170 @@ def delete_resource(resource_type: str, resource_name: str, namespace: str = "de
         return f"✗ Error deleting resource: {e}"
 
 
+import time
+import threading
+
+@mcp.tool()
+def sleep_tool(timeout: int) -> str:
+    """
+    Wait for `timeout` seconds. Use this when you need to pause before checking
+    the status of a resource again.
+
+    Args:
+        timeout (int): Number of seconds to wait.
+
+    Returns:
+        str: Confirmation that the sleep has finished.
+    """
+    time.sleep(timeout)
+    return f"Slept for {timeout} seconds."
+
+
+@mcp.tool()
+def run_bg_task(tool_name: str, tool_arguments: str = "{}") -> str:
+    """
+    Run an existing MCP tool asynchronously in the background.
+    The client will execute the specified tool after this call returns,
+    without blocking the main conversation. The model will be notified
+    with the result once the tool finishes.
+
+    IMPORTANT: If you use this tool, DO NOT call any other tools in the same response.
+    You must end your turn and wait for the client's system notification before continuing.
+
+    Args:
+        tool_name (str): The name of the MCP tool to run in the background
+                         (e.g. "list_pods", "get_events", "rollout_restart_deployment").
+        tool_arguments (str): A JSON string of arguments to pass to the tool.
+                              Example: '{"namespace": "default"}'. Defaults to '{}'.
+
+    Returns:
+        str: A JSON payload the client reads to schedule the background tool call.
+    """
+    try:
+        args = json.loads(tool_arguments)
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"Invalid JSON in tool_arguments: {tool_arguments}"})
+
+    return json.dumps({
+        "action": "bg_task",
+        "tool_name": tool_name,
+        "tool_arguments": args
+    })
+
+
+@mcp.tool()
+def watch_resource(
+    resource_type: str,
+    namespace: str = "default",
+    interval: int = 5,
+    all_namespaces: bool = False
+) -> str:
+    """
+    Immediately fetch the current state of a Kubernetes resource and
+    signal the client to start a polling loop. The client will call
+    this tool again on each interval and inject the result into the
+    model's context, creating a live monitoring loop.
+
+    Supported resource_types: pod, pods, deployment, deployments,
+    service, services, node, nodes, event, events.
+
+    Args:
+        resource_type (str): The type of Kubernetes resource to watch.
+        namespace (str): Namespace to watch. Default is "default".
+        interval (int): Seconds between each refresh. Default is 5.
+        all_namespaces (bool): Watch across all namespaces. Default is False.
+
+    Returns:
+        str: A JSON payload with the current resource state and watch metadata.
+    """
+    v1 = client.CoreV1Api()
+    apps_v1 = client.AppsV1Api()
+
+    rt = resource_type.lower().rstrip("s")  # Normalize: "pods" → "pod"
+
+    try:
+        if rt in ("pod",):
+            if all_namespaces:
+                items = v1.list_pod_for_all_namespaces().items
+            else:
+                items = v1.list_namespaced_pod(namespace).items
+            rows = []
+            for p in items:
+                ns = p.metadata.namespace
+                name = p.metadata.name
+                status = p.status.phase
+                ready = sum(1 for c in (p.status.container_statuses or []) if c.ready)
+                total = len(p.spec.containers)
+                restarts = sum(c.restart_count for c in (p.status.container_statuses or []))
+                rows.append(f"{ns}/{name}: {ready}/{total} Ready, {status}, restarts={restarts}")
+            snapshot = "\n".join(rows) if rows else "No pods found."
+
+        elif rt in ("deployment",):
+            if all_namespaces:
+                items = apps_v1.list_deployment_for_all_namespaces().items
+            else:
+                items = apps_v1.list_namespaced_deployment(namespace).items
+            rows = []
+            for d in items:
+                ns = d.metadata.namespace
+                name = d.metadata.name
+                desired = d.spec.replicas or 0
+                ready = d.status.ready_replicas or 0
+                rows.append(f"{ns}/{name}: {ready}/{desired} Ready")
+            snapshot = "\n".join(rows) if rows else "No deployments found."
+
+        elif rt in ("service",):
+            if all_namespaces:
+                items = v1.list_service_for_all_namespaces().items
+            else:
+                items = v1.list_namespaced_service(namespace).items
+            rows = [f"{i.metadata.namespace}/{i.metadata.name}: {i.spec.type}" for i in items]
+            snapshot = "\n".join(rows) if rows else "No services found."
+
+        elif rt in ("node",):
+            items = v1.list_node().items
+            rows = [f"{n.metadata.name}: {n.status.conditions[-1].type if n.status.conditions else 'Unknown'}" for n in items]
+            snapshot = "\n".join(rows) if rows else "No nodes found."
+
+        elif rt in ("event",):
+            if all_namespaces:
+                items = v1.list_event_for_all_namespaces().items
+            else:
+                items = v1.list_namespaced_event(namespace).items
+            rows = [f"{e.reason}: {e.message}" for e in items[-20:]]  # Last 20 events
+            snapshot = "\n".join(rows) if rows else "No events found."
+
+        else:
+            snapshot = f"Unsupported resource_type '{resource_type}'. Use: pod, deployment, service, node, event."
+
+    except ApiException as e:
+        snapshot = f"API Error fetching {resource_type}: {e.reason}"
+    except Exception as e:
+        snapshot = f"Error: {str(e)}"
+
+    return json.dumps({
+        "action": "watch",
+        "resource_type": resource_type,
+        "namespace": namespace if not all_namespaces else "all",
+        "interval": interval,
+        "snapshot": snapshot,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    })
+
+
+@mcp.tool()
+def stop_watch(resource_type: str) -> str:
+    """
+    Signal the client to stop the polling loop for the given resource type.
+
+    Args:
+        resource_type (str): The resource type that is currently being watched.
+
+    Returns:
+        str: Confirmation that the watch has been stopped.
+    """
+    return json.dumps({"action": "stop_watch", "resource_type": resource_type})
+
 def main():
     """Initialize and run the MCP server with streamable HTTP transport."""
     print("Starting K8s MCP Server...")
