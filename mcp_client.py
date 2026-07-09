@@ -1,17 +1,24 @@
 import os
 import sys
 import warnings
+import asyncio
+import json
+import logging
+import time
+import sqlite3
+import tracing
+from typing import List, Dict, Any
 
 # Suppress Pydantic deprecation warnings early
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
-import asyncio
-import json
-import re
-import sqlite3
-from typing import List, Dict, Any
+# Initialize OpenTelemetry
+tracing.setup_tracing()
 
+import re
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from fastmcp import Client
 from google import genai
 from prompt_toolkit import PromptSession
@@ -98,7 +105,7 @@ class GeminiMCPClient:
         cleaned = {}
         
         for key, value in schema.items():
-            if key in ['additional_properties', 'additionalProperties', 'anyOf', 'any_of', 'allOf', 'all_of', 'oneOf', 'one_of']:
+            if key in ['default', 'title', 'additional_properties', 'additionalProperties', 'anyOf', 'any_of', 'allOf', 'all_of', 'oneOf', 'one_of']:
                 continue
             
             if isinstance(value, dict):
@@ -164,16 +171,18 @@ class GeminiMCPClient:
                 for prop_name, prop_schema in raw_properties.items():
                     properties[prop_name] = self._clean_schema_for_gemini(prop_schema)
             
+            declaration = {
+                'name': tool.name,
+                'description': tool.description or f"Execute {tool.name}",
+                'parameters': {
+                    'type': 'OBJECT',
+                    'properties': properties,
+                    'required': required
+                }
+            }
+                
             gemini_tools.append({
-                'function_declarations': [{
-                    'name': tool.name,
-                    'description': tool.description or f"Execute {tool.name}",
-                    'parameters': {
-                        'type': 'OBJECT',
-                        'properties': properties,
-                        'required': required
-                    }
-                }]
+                'function_declarations': [declaration]
             })
         
         return gemini_tools
@@ -269,6 +278,8 @@ class GeminiMCPClient:
             text = text.replace(latex, unicode_char)
         return text
     
+    from traceloop.sdk.decorators import tool
+    @tool(name="mcp_tool_execution")
     async def _call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Call an MCP tool."""
         try:
@@ -286,6 +297,8 @@ class GeminiMCPClient:
         except Exception as e:
             return f"Error executing tool {tool_name}: {str(e)}"
     
+    from traceloop.sdk.decorators import workflow
+    @workflow(name="kubernetes_chat")
     async def chat_stream(self, user_message: str, max_iterations: int = 10, is_notification: bool = False):
         if is_notification:
             console.print(f"\n[bold yellow]🔔 System Notification:[/bold yellow] {user_message}")
@@ -369,8 +382,16 @@ class GeminiMCPClient:
                             console.print(Group(*renderables))
                             
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     error_str = str(e)
                     console.print(f"[red]API Error: {str(e)}[/red]")
+                    
+                    from opentelemetry import trace
+                    span = trace.get_current_span()
+                    if span.is_recording():
+                        span.record_exception(e)
+
                     # Check for typical 5xx indicators
                     if any(code in error_str for code in ["500", "503", "INTERNAL", "UNAVAILABLE"]):
                         console.print(f"\n[bold yellow]API Interrupted ({error_str}), auto-retrying... ({retry_attempt+1}/{max_api_retries})[/bold yellow]")
@@ -378,6 +399,8 @@ class GeminiMCPClient:
                         await asyncio.sleep(2)
                     else:
                         console.print(f"\n[bold red]Stream Error:[/bold red] {e}")
+                        if span.is_recording():
+                            span.set_status(trace.status.Status(trace.status.StatusCode.ERROR, str(e)))
                         api_success = False
                         break # Unrecoverable, stop retrying
                         
@@ -469,6 +492,8 @@ class GeminiMCPClient:
         
         if iteration >= max_iterations:
             console.print("\n[bold yellow](Max iterations reached)[/bold yellow]")
+            
+        return clean_response if 'clean_response' in locals() else (current_text if 'current_text' in locals() else None)
             
     async def _bg_task(self, tool_name: str, tool_arguments: dict):
         """Actually call the given MCP tool in the background and notify the model with the result."""

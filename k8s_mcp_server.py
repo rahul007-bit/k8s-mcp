@@ -10,13 +10,52 @@ from mcp.server.fastmcp import FastMCP
 from kubernetes.stream import stream
 from typing import List, Optional, Dict, Any
 from kubernetes.client.exceptions import ApiException
+import subprocess
 
+
+# Tracing configuration
+from tracing import setup_tracing
+setup_tracing(app_name="k8s-mcp-server")
+
+from opentelemetry import trace
+import functools
+
+tracer = trace.get_tracer("k8s-mcp-server.subprocess")
+_original_run = subprocess.run
+
+@functools.wraps(_original_run)
+def _traced_subprocess_run(*args, **kwargs):
+    cmd_args = args[0] if args else kwargs.get('args', [])
+    cmd_str = " ".join(cmd_args) if isinstance(cmd_args, list) else str(cmd_args)
+    
+    with tracer.start_as_current_span(f"subprocess.run: {cmd_str.split(' ')[0] if cmd_str else 'unknown'}") as span:
+        span.set_attribute("subprocess.command", cmd_str)
+        try:
+            return _original_run(*args, **kwargs)
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(trace.StatusCode.ERROR, str(e))
+            raise
+
+subprocess.run = _traced_subprocess_run
 
 # Load Kubernetes configuration
 config.load_kube_config()
 
 # Initialize MCP server
 mcp = FastMCP("k8s-agent")
+
+# Automatically trace all tools
+from traceloop.sdk.decorators import task
+_original_tool = mcp.tool
+
+def _traced_tool(*args, **kwargs):
+    def decorator(func):
+        wrapped_func = task(name=func.__name__)(func)
+        return _original_tool(*args, **kwargs)(wrapped_func)
+    return decorator
+
+mcp.tool = _traced_tool
 
 
 @mcp.tool()
@@ -667,269 +706,38 @@ def apply_yaml(yaml_content: str, namespace: str = "default") -> str:
     """
     try:
         import yaml
-        resources = yaml.safe_load_all(yaml_content)
-
-        results = []
+        import subprocess
+        resources = list(yaml.safe_load_all(yaml_content))
+        
+        # Inject namespace if provided and not in YAML
         for resource in resources:
-            if resource is None:
-                continue
-
-            kind = resource.get("kind", "Unknown")
-            name = resource.get("metadata", {}).get("name", "unknown")
-            ns = resource.get("metadata", {}).get("namespace", namespace)
-
-            # Ensure metadata and namespace are present
-            if "metadata" not in resource:
-                resource["metadata"] = {}
-            if "namespace" not in resource["metadata"] and ns:
-                resource["metadata"]["namespace"] = ns
-
-            try:
-                # Prepare API clients
-                v1 = client.CoreV1Api()
-                apps_v1 = client.AppsV1Api()
-                batch_v1 = client.BatchV1Api()
-                networking_v1 = client.NetworkingV1Api()
-                rbac_v1 = client.RbacAuthorizationV1Api()
-                autoscaling_v2 = client.AutoscalingV2Api()
-
-                # Upsert logic per kind: try read -> patch, on 404 create
-                if kind == "Pod":
-                    try:
-                        v1.read_namespaced_pod(name=name, namespace=ns)
-                        v1.patch_namespaced_pod(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Pod {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespaced_pod(namespace=ns, body=resource)
-                            results.append(f"✓ Pod {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Pod {name}: {e.reason}")
-                elif kind == "Service":
-                    try:
-                        v1.read_namespaced_service(name=name, namespace=ns)
-                        v1.patch_namespaced_service(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Service {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespaced_service(namespace=ns, body=resource)
-                            results.append(f"✓ Service {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Service {name}: {e.reason}")
-                elif kind == "Deployment":
-                    try:
-                        apps_v1.read_namespaced_deployment(name=name, namespace=ns)
-                        apps_v1.patch_namespaced_deployment(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Deployment {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            apps_v1.create_namespaced_deployment(namespace=ns, body=resource)
-                            results.append(f"✓ Deployment {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Deployment {name}: {e.reason}")
-                elif kind == "StatefulSet":
-                    try:
-                        apps_v1.read_namespaced_stateful_set(name=name, namespace=ns)
-                        apps_v1.patch_namespaced_stateful_set(name=name, namespace=ns, body=resource)
-                        results.append(f"~ StatefulSet {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            apps_v1.create_namespaced_stateful_set(namespace=ns, body=resource)
-                            results.append(f"✓ StatefulSet {name} created in {ns}")
-                        else:
-                            results.append(f"✗ StatefulSet {name}: {e.reason}")
-                elif kind == "DaemonSet":
-                    try:
-                        apps_v1.read_namespaced_daemon_set(name=name, namespace=ns)
-                        apps_v1.patch_namespaced_daemon_set(name=name, namespace=ns, body=resource)
-                        results.append(f"~ DaemonSet {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            apps_v1.create_namespaced_daemon_set(namespace=ns, body=resource)
-                            results.append(f"✓ DaemonSet {name} created in {ns}")
-                        else:
-                            results.append(f"✗ DaemonSet {name}: {e.reason}")
-                elif kind == "ConfigMap":
-                    try:
-                        v1.read_namespaced_config_map(name=name, namespace=ns)
-                        v1.patch_namespaced_config_map(name=name, namespace=ns, body=resource)
-                        results.append(f"~ ConfigMap {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespaced_config_map(namespace=ns, body=resource)
-                            results.append(f"✓ ConfigMap {name} created in {ns}")
-                        else:
-                            results.append(f"✗ ConfigMap {name}: {e.reason}")
-                elif kind == "Secret":
-                    try:
-                        v1.read_namespaced_secret(name=name, namespace=ns)
-                        v1.patch_namespaced_secret(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Secret {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespaced_secret(namespace=ns, body=resource)
-                            results.append(f"✓ Secret {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Secret {name}: {e.reason}")
-                elif kind in ["PersistentVolumeClaim", "PersistentVolumeClaim".lower()]:
-                    try:
-                        v1.read_namespaced_persistent_volume_claim(name=name, namespace=ns)
-                        v1.patch_namespaced_persistent_volume_claim(name=name, namespace=ns, body=resource)
-                        results.append(f"~ PVC {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespaced_persistent_volume_claim(namespace=ns, body=resource)
-                            results.append(f"✓ PVC {name} created in {ns}")
-                        else:
-                            results.append(f"✗ PVC {name}: {e.reason}")
-                elif kind == "PersistentVolume":
-                    try:
-                        v1.read_persistent_volume(name=name)
-                        v1.patch_persistent_volume(name=name, body=resource)
-                        results.append(f"~ PV {name} patched")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_persistent_volume(body=resource)
-                            results.append(f"✓ PV {name} created")
-                        else:
-                            results.append(f"✗ PV {name}: {e.reason}")
-                elif kind == "Ingress":
-                    try:
-                        networking_v1.read_namespaced_ingress(name=name, namespace=ns)
-                        networking_v1.patch_namespaced_ingress(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Ingress {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            networking_v1.create_namespaced_ingress(namespace=ns, body=resource)
-                            results.append(f"✓ Ingress {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Ingress {name}: {e.reason}")
-                elif kind == "NetworkPolicy":
-                    try:
-                        networking_v1.read_namespaced_network_policy(name=name, namespace=ns)
-                        networking_v1.patch_namespaced_network_policy(name=name, namespace=ns, body=resource)
-                        results.append(f"~ NetworkPolicy {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            networking_v1.create_namespaced_network_policy(namespace=ns, body=resource)
-                            results.append(f"✓ NetworkPolicy {name} created in {ns}")
-                        else:
-                            results.append(f"✗ NetworkPolicy {name}: {e.reason}")
-                elif kind == "Role":
-                    try:
-                        rbac_v1.read_namespaced_role(name=name, namespace=ns)
-                        rbac_v1.patch_namespaced_role(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Role {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            rbac_v1.create_namespaced_role(namespace=ns, body=resource)
-                            results.append(f"✓ Role {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Role {name}: {e.reason}")
-                elif kind == "RoleBinding":
-                    try:
-                        rbac_v1.read_namespaced_role_binding(name=name, namespace=ns)
-                        rbac_v1.patch_namespaced_role_binding(name=name, namespace=ns, body=resource)
-                        results.append(f"~ RoleBinding {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            rbac_v1.create_namespaced_role_binding(namespace=ns, body=resource)
-                            results.append(f"✓ RoleBinding {name} created in {ns}")
-                        else:
-                            results.append(f"✗ RoleBinding {name}: {e.reason}")
-                elif kind == "ClusterRole":
-                    try:
-                        rbac_v1.read_cluster_role(name=name)
-                        rbac_v1.patch_cluster_role(name=name, body=resource)
-                        results.append(f"~ ClusterRole {name} patched")
-                    except ApiException as e:
-                        if e.status == 404:
-                            rbac_v1.create_cluster_role(body=resource)
-                            results.append(f"✓ ClusterRole {name} created")
-                        else:
-                            results.append(f"✗ ClusterRole {name}: {e.reason}")
-                elif kind == "ClusterRoleBinding":
-                    try:
-                        rbac_v1.read_cluster_role_binding(name=name)
-                        rbac_v1.patch_cluster_role_binding(name=name, body=resource)
-                        results.append(f"~ ClusterRoleBinding {name} patched")
-                    except ApiException as e:
-                        if e.status == 404:
-                            rbac_v1.create_cluster_role_binding(body=resource)
-                            results.append(f"✓ ClusterRoleBinding {name} created")
-                        else:
-                            results.append(f"✗ ClusterRoleBinding {name}: {e.reason}")
-                elif kind == "ServiceAccount":
-                    try:
-                        v1.read_namespaced_service_account(name=name, namespace=ns)
-                        v1.patch_namespaced_service_account(name=name, namespace=ns, body=resource)
-                        results.append(f"~ ServiceAccount {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespaced_service_account(namespace=ns, body=resource)
-                            results.append(f"✓ ServiceAccount {name} created in {ns}")
-                        else:
-                            results.append(f"✗ ServiceAccount {name}: {e.reason}")
-                elif kind == "Namespace":
-                    try:
-                        v1.read_namespace(name=name)
-                        v1.patch_namespace(name=name, body=resource)
-                        results.append(f"~ Namespace {name} patched")
-                    except ApiException as e:
-                        if e.status == 404:
-                            v1.create_namespace(body=resource)
-                            results.append(f"✓ Namespace {name} created")
-                        else:
-                            results.append(f"✗ Namespace {name}: {e.reason}")
-                elif kind in ["HorizontalPodAutoscaler", "Horizontalpodautoscaler", "hpa"]:
-                    try:
-                        autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(name=name, namespace=ns)
-                        autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler(name=name, namespace=ns, body=resource)
-                        results.append(f"~ HPA {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            autoscaling_v2.create_namespaced_horizontal_pod_autoscaler(namespace=ns, body=resource)
-                            results.append(f"✓ HPA {name} created in {ns}")
-                        else:
-                            results.append(f"✗ HPA {name}: {e.reason}")
-                elif kind == "Job":
-                    try:
-                        batch_v1.read_namespaced_job(name=name, namespace=ns)
-                        batch_v1.patch_namespaced_job(name=name, namespace=ns, body=resource)
-                        results.append(f"~ Job {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            batch_v1.create_namespaced_job(namespace=ns, body=resource)
-                            results.append(f"✓ Job {name} created in {ns}")
-                        else:
-                            results.append(f"✗ Job {name}: {e.reason}")
-                elif kind == "CronJob":
-                    try:
-                        batch_v1.read_namespaced_cron_job(name=name, namespace=ns)
-                        batch_v1.patch_namespaced_cron_job(name=name, namespace=ns, body=resource)
-                        results.append(f"~ CronJob {name} patched in {ns}")
-                    except ApiException as e:
-                        if e.status == 404:
-                            batch_v1.create_namespaced_cron_job(namespace=ns, body=resource)
-                            results.append(f"✓ CronJob {name} created in {ns}")
-                        else:
-                            results.append(f"✗ CronJob {name}: {e.reason}")
-                else:
-                    results.append(f"⚠ {kind} {name}: Unsupported resource type")
-                    continue
-
-            except ApiException as e:
-                # Specific API errors
-                if getattr(e, "status", None) == 409:
-                    results.append(f"⚠ {kind} {name}: Already exists")
-                else:
-                    results.append(f"✗ {kind} {name}: {getattr(e, 'reason', str(e))}")
-            except Exception as e:
-                results.append(f"✗ {kind} {name}: {str(e)}")
-
-        return "\n".join(results) if results else "No resources to apply"
+            if resource and isinstance(resource, dict):
+                if "metadata" not in resource:
+                    resource["metadata"] = {}
+                # Only inject if namespace is explicitly provided (not default) or if it's missing entirely
+                if "namespace" not in resource["metadata"]:
+                    if namespace:
+                        resource["metadata"]["namespace"] = namespace
+                        
+        modified_yaml = yaml.safe_dump_all(resources)
+        
+        cmd = ["kubectl", "apply", "-f", "-"]
+        result = subprocess.run(
+            cmd, 
+            input=modified_yaml,
+            capture_output=True, 
+            text=True, 
+            check=True
+        )
+        
+        output = result.stdout.strip()
+        if not output:
+            return "Resource(s) applied successfully (no output)."
+        return output
+    except subprocess.CalledProcessError as e:
+        return f"Error applying YAML: {e.stderr}"
     except Exception as e:
-        return f"Error parsing YAML: {e}"
+        return f"Error executing apply_yaml: {e}"
 
 
 @mcp.tool()
@@ -1816,6 +1624,180 @@ def stop_watch(resource_type: str) -> str:
         str: Confirmation that the watch has been stopped.
     """
     return json.dumps({"action": "stop_watch", "resource_type": resource_type})
+
+
+@mcp.tool()
+def helm_list(namespace: str = "default") -> str:
+    """
+    List helm releases in a namespace.
+    
+    Args:
+        namespace (str): The namespace to list releases from.
+    """
+    cmd = ["helm", "list", "--namespace", namespace, "-o", "json"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        return json.dumps({"error": f"Helm command failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
+
+@mcp.tool()
+def helm_install(release_name: str, chart: str, namespace: str = "default", values_yaml: Optional[str] = None) -> str:
+    """
+    Install a helm chart.
+    
+    Args:
+        release_name (str): Name of the release.
+        chart (str): Chart to install.
+        namespace (str): Namespace to install into.
+        values_yaml (Optional[str]): YAML string containing values to pass.
+    """
+    cmd = ["helm", "install", release_name, chart, "--namespace", namespace]
+    
+    if values_yaml:
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as f:
+            f.write(values_yaml)
+            tmp_path = f.name
+        cmd.extend(["-f", tmp_path])
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if values_yaml:
+            os.remove(tmp_path)
+        return json.dumps({"success": True, "output": result.stdout})
+    except subprocess.CalledProcessError as e:
+        if values_yaml and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return json.dumps({"error": f"Helm install failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
+
+@mcp.tool()
+def helm_upgrade(release_name: str, chart: str, namespace: str = "default", values_yaml: Optional[str] = None) -> str:
+    """
+    Upgrade a helm chart.
+    
+    Args:
+        release_name (str): Name of the release.
+        chart (str): Chart to upgrade.
+        namespace (str): Namespace of the release.
+        values_yaml (Optional[str]): YAML string containing values to pass.
+    """
+    cmd = ["helm", "upgrade", release_name, chart, "--namespace", namespace]
+    
+    if values_yaml:
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as f:
+            f.write(values_yaml)
+            tmp_path = f.name
+        cmd.extend(["-f", tmp_path])
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if values_yaml:
+            os.remove(tmp_path)
+        return json.dumps({"success": True, "output": result.stdout})
+    except subprocess.CalledProcessError as e:
+        if values_yaml and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return json.dumps({"error": f"Helm upgrade failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
+
+@mcp.tool()
+def helm_uninstall(release_name: str, namespace: str = "default") -> str:
+    """
+    Uninstall a helm chart.
+    
+    Args:
+        release_name (str): Name of the release.
+        namespace (str): Namespace of the release.
+    """
+    cmd = ["helm", "uninstall", release_name, "--namespace", namespace]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.dumps({"success": True, "output": result.stdout})
+    except subprocess.CalledProcessError as e:
+        return json.dumps({"error": f"Helm uninstall failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
+
+@mcp.tool()
+def search_web(query: str, max_results: int = 5) -> str:
+    """
+    Perform a free web search using DuckDuckGo.
+    
+    Args:
+        query (str): The search query.
+        max_results (int): Maximum number of results to return (default 5).
+    """
+    try:
+        from ddgs import DDGS
+        results = DDGS().text(query, max_results=max_results)
+        return json.dumps({"success": True, "results": results})
+    except ImportError:
+        return json.dumps({"error": "ddgs package is not installed."})
+    except Exception as e:
+        return json.dumps({"error": f"Search failed: {str(e)}"})
+
+
+@mcp.tool()
+def helm_repo_add(name: str, url: str) -> str:
+    """
+    Add a new helm repository.
+    
+    Args:
+        name (str): Name of the repository to add.
+        url (str): URL of the repository.
+    """
+    cmd = ["helm", "repo", "add", name, url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.dumps({"success": True, "output": result.stdout})
+    except subprocess.CalledProcessError as e:
+        return json.dumps({"error": f"Helm repo add failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
+
+@mcp.tool()
+def helm_repo_list() -> str:
+    """
+    List all added helm repositories.
+    """
+    cmd = ["helm", "repo", "list", "-o", "json"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        return json.dumps({"error": f"Helm repo list failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
+
+@mcp.tool()
+def helm_repo_update() -> str:
+    """
+    Update all helm repositories.
+    """
+    cmd = ["helm", "repo", "update"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.dumps({"success": True, "output": result.stdout})
+    except subprocess.CalledProcessError as e:
+        return json.dumps({"error": f"Helm repo update failed: {e.stderr}"})
+    except FileNotFoundError:
+        return json.dumps({"error": "Helm executable not found"})
+
 
 def main():
     """Initialize and run the MCP server with streamable HTTP transport."""
